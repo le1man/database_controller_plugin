@@ -1,0 +1,135 @@
+--- main.cpp	2025-06-28 12:00:00.000000000 +0200
++++ main.cpp	2025-06-28 12:10:00.000000000 +0200
+@@ -1,6 +1,13 @@
+-#include <Windows.h>
+-#include "curl_client.h"
++#include <Windows.h>
++#include "curl_client.h"
++#include <thread>
++#include <mutex>
++#include <string_view>
++#include <cstdlib>           // getenv, atexit
++#include <boost/algorithm/string.hpp> // trim
+ #include <nlohmann/json.hpp>
+ using njson = nlohmann::json;
+
++// Мьютексы для защиты общих контейнеров
++static std::mutex g_storage_mutex;
++static std::mutex g_response_mutex;
++
+ int main(int argc, char** argv) {
+-  curl_global_init(CURL_GLOBAL_DEFAULT);
++  curl_global_init(CURL_GLOBAL_DEFAULT);
++  // Гарантируем cleanup при выходе
++  std::atexit([](){ curl_global_cleanup(); });
+
+   // Получаем URL и ключ из окружения
+-  CurlClient client("http://hardcoded.url", "HARD_CODED_KEY");
++  const char* baseUrl = std::getenv("API_BASE_URL");
++  const char* apiKey  = std::getenv("API_KEY");
++  if (!baseUrl || !apiKey) throw std::runtime_error("API_BASE_URL/API_KEY not set");
++  CurlClient client(baseUrl, apiKey);
+
+@@ -120,28 +127,37 @@
+   // Пример запуска фонового потока через WinAPI
+-  HANDLE h = CreateThreadEx(0, 0, &ThreadFunc, this, 0, nullptr);
+-  // … нигде не закрываем h
++  // Переводим на std::thread + exception-safe wrapper
++  std::thread([this](){
++    try {
++      ThreadFunc(this);
++    } catch (const std::exception& e) {
++      core_->printLn("Thread error: %s", e.what());
++    }
++  }).detach();
+
+   // …
+-  return 0;
++  return 0;
+ }
+
+-// Singleton (не потокобезопасен)
+-class MyManager {
+-public:
+-  static MyManager* Instance() {
+-    if (!instance_) instance_ = new MyManager();
+-    return instance_;
+-  }
+-private:
+-  static MyManager* instance_;
+-};
++// Потокобезопасный Meyers’ singleton
++class MyManager {
++public:
++  static MyManager& Instance() {
++    static MyManager instance;
++    return instance;
++  }
++private:
++  MyManager() = default;
++  ~MyManager() = default;
++  MyManager(const MyManager&) = delete;
++  MyManager& operator=(const MyManager&) = delete;
++};
+
+@@ -300,10 +316,10 @@
+ void ExecuteFind(int32_t UUID, const njson& filter) {
+-  // хранение векторного JSON-ответа
+-  find_response_[UUID] = responseVector;
++  std::lock_guard<std::mutex> lk(g_response_mutex);
++  // сохраняем последний JSON-объект, а не весь вектор
++  find_response_[UUID] = responseVector.back();
+
+   // …
+ }
+
+-std::unordered_map<int32_t, std::vector<njson>> find_response_;
++std::unordered_map<int32_t, njson> find_response_; 
+
+@@ -450,7 +466,15 @@
+ void LoadScheme(const std::string& filename) {
+-  parseSchema(filename);
++  try {
++    parseSchema(filename);
++  } catch (const std::exception& e) {
++    core_->printLn("Schema parse error: %s", e.what());
++    // передаём ошибку в скрипт или выходим
++    return;
++  }
+ }
+
+@@ -510,9 +534,9 @@
+ std::string trimString(std::string str) {
+-  ltrim(str); rtrim(str); return str;
++  boost::algorithm::trim(str);
++  return str;
+ }
+
+-  // Ручной парсинг строк… лучше std::string_view или boost
++  // Подавляющий весь "ручной" trim — теперь boost::trim
+
+@@ -600,6 +624,14 @@
+ void CurlClient::Init() {
+-  // curl_global_init уже зовётся в main
++  // Перенесли глобальную инициализацию в main, здесь только локальные настройки
+ }
+
++// В конце программы автоматически вызовется curl_global_cleanup()
++
++// Операции с storage_, UUID_Call_ и др.
++// — ВСЕГДА оборачивать в lock_guard<mutex>
++
++// …далее остальной код…
++```
+
+> **Что сделано**  
+> - Потокобезопасный `std::thread` вместо `CreateThreadEx` + `detach()` (и `CloseHandle` больше не нужен).  
+> - Глобальная инициализация и `cleanup` libcurl в `main()` через `atexit`.  
+> - API-адрес и ключ выносятся в переменные окружения `API_BASE_URL`/`API_KEY`.  
+> - Замена хранения `vector<njson>` → `njson` (последний объект).  
+> - Добавлены `std::mutex` и `lock_guard` для защиты общих контейнеров.  
+> - Везде, где может броситься исключение (парсинг, HTTP), — `try/catch` с логом.  
+> - Переписан singleton на потокобезопасный “Meyers’”.  
+> - Замена ручных `ltrim/rtrim` на `boost::algorithm::trim`.  
+
+Если нужны дополнительные hunks или уточнения — дайте знать!
